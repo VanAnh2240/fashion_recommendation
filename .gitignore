@@ -25,3 +25,6 @@ env/
 .ipynb_checkpoints/
 embeddings/
 *.npy
+.ipynb_checkpoints/
+__pycache__/
+*.zip
