@@ -1,59 +1,49 @@
-# File src/models/bpr.py
-
+"""
+BPR-MF — Bayesian Personalized Ranking Matrix Factorization
+Baseline model: không dùng graph, không dùng embedding ảnh.
+Chỉ học từ interaction matrix (customer_id, article_id).
+Input : (user_idx, pos_item_idx, neg_item_idx)  ← BPR triplet
+Output: logit per (user, item)                  ← dot(e_u, e_i) / scale
+        caller tự sigmoid khi cần score [0,1]
+"""
 import torch
 import torch.nn as nn
 
 
-class BPRMatrixFactorization(nn.Module):
-    """
-    BPR-MF (Bayesian Personalized Ranking)
-
-    Baseline recommendation truyền thống (không dùng graph)
-
-    Ý tưởng:
-    - Học embedding user và item
-    - Tối ưu ranking: user thích item positive hơn item negative
-    """
-
-    def __init__(self, num_users, num_items, embedding_dim=64):
-        super(BPRMatrixFactorization, self).__init__()
-
-        self.num_users = num_users
-        self.num_items = num_items
+class BPRModel(nn.Module):
+    def __init__(
+        self,
+        n_users: int,
+        n_items: int,
+        embedding_dim: int = 64,
+        logit_scale: float = 1.0,   # FIX: 2.0 → 1.0 (bớt scale down score)
+    ):
+        super().__init__()
+        self.n_users       = n_users
+        self.n_items       = n_items
         self.embedding_dim = embedding_dim
+        self.logit_scale   = logit_scale
 
-        # embedding cho user và item
-        self.user_embedding = nn.Embedding(num_users, embedding_dim)
-        self.item_embedding = nn.Embedding(num_items, embedding_dim)
+        self.user_emb = nn.Embedding(n_users, embedding_dim)
+        self.item_emb = nn.Embedding(n_items, embedding_dim)
 
-        nn.init.xavier_uniform_(self.user_embedding.weight)
-        nn.init.xavier_uniform_(self.item_embedding.weight)
+        # FIX: xavier_uniform_ → normal_(std=0.1)
+        # xavier tính fan_in từ n_users (~1.3M) → std cực nhỏ (~0.001) → gradient chết
+        # normal std=0.1 là convention chuẩn cho BPR/MF large-scale
+        nn.init.normal_(self.user_emb.weight, mean=0.0, std=0.1)
+        nn.init.normal_(self.item_emb.weight, mean=0.0, std=0.1)
 
-    def forward(self, user_ids, item_pos, item_neg):
-        """
-        Forward cho BPR loss training
+    def forward(self, user_idx: torch.Tensor, item_idx: torch.Tensor) -> torch.Tensor:
+        """Trả logit (chưa sigmoid)."""
+        e_u = self.user_emb(user_idx)
+        e_i = self.item_emb(item_idx)
+        return (e_u * e_i).sum(dim=-1) / self.logit_scale
 
-        Args:
-            user_ids: user batch
-            item_pos: item user đã tương tác (positive)
-            item_neg: item user chưa tương tác (negative)
-        """
+    def bpr_loss(self, user_idx, pos_item_idx, neg_item_idx) -> torch.Tensor:
+        pos_score = self.forward(user_idx, pos_item_idx)
+        neg_score = self.forward(user_idx, neg_item_idx)
+        return -torch.log(torch.sigmoid(pos_score - neg_score) + 1e-8).mean()
 
-        user_vec = self.user_embedding(user_ids)
-        pos_vec = self.item_embedding(item_pos)
-        neg_vec = self.item_embedding(item_neg)
-
-        # score positive và negative
-        pos_score = torch.sum(user_vec * pos_vec, dim=1)
-        neg_score = torch.sum(user_vec * neg_vec, dim=1)
-
-        return pos_score, neg_score
-
-    def predict(self, user_ids, item_ids):
-        """
-        Dự đoán score user-item (inference)
-        """
-        user_vec = self.user_embedding(user_ids)
-        item_vec = self.item_embedding(item_ids)
-
-        return torch.sum(user_vec * item_vec, dim=1)
+    @torch.no_grad()
+    def predict(self, user_idx: torch.Tensor, item_idx: torch.Tensor) -> torch.Tensor:
+        return self.forward(user_idx, item_idx)

@@ -1,4 +1,4 @@
-# File configs/config.py
+# File config.py
 
 import torch
 from pathlib import Path
