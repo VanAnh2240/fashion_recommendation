@@ -336,6 +336,7 @@ class HMGNNTrainer:
             persistent_workers=(_NUM_WORKERS > 0),
         )
 
+        # FIX: use_cache=False để tránh dùng cache stale từ train
         all_user_emb, all_item_emb = model(edge_index, use_cache=False)
 
         preds, labels = [], []
@@ -461,8 +462,16 @@ class HMGNNTrainer:
             model.precompute_norm_adj(edge_index, n)
             print("[SETUP] norm_adj precomputed")
 
-        optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
-        # FIX: track AUC thay vì F1 vì AUC không phụ thuộc threshold
+        # FIX: differential LR — bảo vệ CLIP-initialized embeddings
+        # Embedding đã có semantic meaning từ CLIP → học chậm hơn (×0.1)
+        # Linear layer chưa có prior → học nhanh bình thường
+        emb_params   = [p for n, p in model.named_parameters() if "embedding" in n]
+        other_params = [p for n, p in model.named_parameters() if "embedding" not in n]
+        optimizer = torch.optim.Adam([
+            {"params": emb_params,   "lr": LEARNING_RATE * 0.1},
+            {"params": other_params, "lr": LEARNING_RATE},
+        ], lr=LEARNING_RATE)
+
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode="max", factor=0.5, patience=5,
         )
@@ -473,9 +482,11 @@ class HMGNNTrainer:
         ckpt_name = f"{self.feature}_{self.model_name}.pth"
         ckpt_path = self.ckpt_dir / ckpt_name
 
-        start_epoch = 1
-        best_auc    = 0.0   # FIX: dùng AUC thay F1 để chọn best checkpoint
-        best_epoch  = 0
+        start_epoch      = 1
+        best_auc         = 0.0
+        best_epoch       = 0
+        epochs_no_improve = 0      # FIX: early stopping counter
+        _EARLY_STOP_PATIENCE = 5
 
         if ckpt_path.exists():
             print(f"[RESUME] Load từ {ckpt_path}")
@@ -493,9 +504,10 @@ class HMGNNTrainer:
             torch.cuda.empty_cache()
 
         for epoch in range(start_epoch, NUM_EPOCHS + 1):
-            # FIX: hard negative sampling từ epoch 2 trở đi
-            # Epoch 1 dùng uniform để model warm-up, sau đó dùng popularity-based
-            if epoch <= 2:
+            # FIX: delay hard negatives đến epoch 6
+            # Epoch 1-5: uniform sampling để model ổn định với CLIP init
+            # Epoch 6+: popularity-based hard negatives
+            if epoch <= 5:
                 train_dataset.resample(item_popularity=None)
             else:
                 train_dataset.resample(item_popularity=item_popularity)
@@ -520,16 +532,22 @@ class HMGNNTrainer:
 
             # FIX: save checkpoint theo AUC thay vì F1
             if val_metrics["auc"] > best_auc:
-                best_auc   = val_metrics["auc"]
-                best_epoch = epoch
+                best_auc          = val_metrics["auc"]
+                best_epoch        = epoch
+                epochs_no_improve = 0
                 torch.save({
                     "model":     model.state_dict(),
                     "optimizer": optimizer.state_dict(),
                     "epoch":     epoch,
                     "best_auc":  best_auc,
-                    "best_f1":   val_metrics["f1"],   # giữ lại để tham khảo
+                    "best_f1":   val_metrics["f1"],
                 }, ckpt_path)
                 print(f"  ✓ Saved {ckpt_name} (auc={best_auc:.4f}, f1={val_metrics['f1']:.4f}, epoch={epoch})\n")
+            else:
+                epochs_no_improve += 1
+                if epochs_no_improve >= _EARLY_STOP_PATIENCE:
+                    print(f"\n[EARLY STOP] No improvement for {_EARLY_STOP_PATIENCE} epochs. Stopping at epoch {epoch}.")
+                    break
 
         print(f"\n[TRAIN DONE] Best val AUC={best_auc:.4f} at epoch {best_epoch}")
 

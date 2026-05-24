@@ -16,17 +16,19 @@ class GraphSAGE(nn.Module):
     - reduced overhead in forward
     """
 
-    def __init__(self, num_users, num_items, embedding_dim=64, hidden_dim=64):
+    def __init__(self, num_users, num_items, embedding_dim=64, hidden_dim=64, dropout=0.1):
         super().__init__()
 
-        self.num_users = num_users
-        self.num_items = num_items
+        self.num_users     = num_users
+        self.num_items     = num_items
         self.embedding_dim = embedding_dim
 
         self.user_embedding = nn.Embedding(num_users, embedding_dim)
         self.item_embedding = nn.Embedding(num_items, embedding_dim)
 
-        self.linear = nn.Linear(embedding_dim * 2, hidden_dim)
+        self.linear  = nn.Linear(embedding_dim * 2, hidden_dim)
+        # FIX: dropout để regularize, giảm overfit sau CLIP init
+        self.dropout = nn.Dropout(p=dropout)
 
         nn.init.xavier_uniform_(self.user_embedding.weight)
         nn.init.xavier_uniform_(self.item_embedding.weight)
@@ -109,6 +111,7 @@ class GraphSAGE(nn.Module):
         out = torch.cat([all_emb, agg_emb], dim=1)
         out = self.linear(out)
         out = F.relu(out)
+        out = self.dropout(out)   # FIX: dropout sau activation
 
         users_out, items_out = torch.split(
             out,
