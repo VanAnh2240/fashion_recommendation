@@ -18,7 +18,7 @@ import torch
 import torch.nn.functional as F
 from torch.amp import autocast, GradScaler
 from torch.utils.data import DataLoader, Dataset
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, roc_curve
 torch.set_float32_matmul_precision("high")
 
 from config import (
@@ -37,7 +37,7 @@ CSV_CHUNK         = 500_000
 _TRAIN_BATCH_SIZE = BATCH_SIZE * 12
 _NUM_WORKERS      = 16
 _GRAD_ACCUM       = 1
-_L2_REG           = 1e-4  
+_L2_REG           = 1e-4   # FIX: L2 regularization weight cho BPR loss
 
 
 def set_seed(seed=SEED):
@@ -336,7 +336,6 @@ class HMGNNTrainer:
             persistent_workers=(_NUM_WORKERS > 0),
         )
 
-        # FIX: use_cache=False để tránh dùng cache stale từ train
         all_user_emb, all_item_emb = model(edge_index, use_cache=False)
 
         preds, labels = [], []
@@ -366,16 +365,24 @@ class HMGNNTrainer:
         return preds, labels
 
     def _compute_metrics(self, preds: np.ndarray, labels: np.ndarray) -> dict:
-        # FIX: dynamic median threshold thay vì hardcode THRESHOLD
-        threshold = float(np.median(preds))
-        y_pred = (preds >= threshold).astype(int)
         y_true = labels.astype(int)
 
-        # FIX: thêm AUC — metric đáng tin cậy hơn F1 vì không phụ thuộc threshold
         try:
             auc = roc_auc_score(y_true, preds)
         except ValueError:
-            auc = 0.5  # fallback nếu chỉ có 1 class
+            auc = 0.5
+
+        # FIX: dùng Youden's J (tpr - fpr) để tìm threshold tối ưu từ ROC curve
+        # Median threshold sai vì với neg_ratio=1 (50/50 dataset), median luôn
+        # chia đôi → acc=prec=rec=f1 bất kể model học tốt hay không
+        try:
+            fpr, tpr, thresholds = roc_curve(y_true, preds)
+            best_idx      = int(np.argmax(tpr - fpr))
+            best_threshold = float(thresholds[best_idx])
+        except ValueError:
+            best_threshold = 0.5
+
+        y_pred = (preds >= best_threshold).astype(int)
 
         return {
             "accuracy":  accuracy_score(y_true, y_pred),
@@ -383,6 +390,7 @@ class HMGNNTrainer:
             "recall":    recall_score(y_true, y_pred, zero_division=0),
             "f1":        f1_score(y_true, y_pred, zero_division=0),
             "auc":       auc,
+            "threshold": best_threshold,
         }
 
     # ── main entry ────────────────────────────────────────────────────────
@@ -506,7 +514,8 @@ class HMGNNTrainer:
                 f"prec={val_metrics['precision']:.4f} "
                 f"rec={val_metrics['recall']:.4f} "
                 f"f1={val_metrics['f1']:.4f} "
-                f"auc={val_metrics['auc']:.4f}"
+                f"auc={val_metrics['auc']:.4f} "
+                f"thr={val_metrics['threshold']:.4f}"
             )
 
             # FIX: save checkpoint theo AUC thay vì F1
@@ -536,7 +545,8 @@ class HMGNNTrainer:
             f"prec={test_metrics['precision']:.4f} "
             f"rec={test_metrics['recall']:.4f} "
             f"f1={test_metrics['f1']:.4f} "
-            f"auc={test_metrics['auc']:.4f}"
+            f"auc={test_metrics['auc']:.4f} "
+            f"thr={test_metrics['threshold']:.4f}"
         )
 
         if evaluator is not None:
