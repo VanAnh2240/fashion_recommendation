@@ -572,7 +572,6 @@ class HMGNNTrainer:
                 dataset="hm",
                 feature=self.feature,
                 model_name=self.model_name,
-                all_preds=test_preds,
                 all_targets=test_labels,
             )
 
