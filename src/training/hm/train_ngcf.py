@@ -1,9 +1,5 @@
 """
 src/training/hm/train_ngcf.py — NGCF Trainer for H&M
-Kế thừa toàn bộ logic từ train_lightgcn.py, chỉ khác:
-  - model_name = "ngcf"
-  - NGCF nặng hơn LightGCN → batch nhỏ hơn, grad accum nhiều hơn
-  - _GRAD_ACCUM = 2  (effective batch lớn hơn mà không OOM)
 """
 
 import os
@@ -37,12 +33,11 @@ from config import (
 from src.models.model_factory import get_model
 from src.evaluation.evaluator import Evaluator
 
-# ── Hyperparams cụ thể cho NGCF ──────────────────────────────────────────────
-# NGCF nặng hơn LightGCN (có W1, W2 + nonlinear) → giảm batch, tăng accum
 CSV_CHUNK         = 500_000
-_TRAIN_BATCH_SIZE = max(BATCH_SIZE * 4, 4096)   # nhỏ hơn LightGCN để tránh OOM
+_TRAIN_BATCH_SIZE = 4096
 _NUM_WORKERS      = NUM_WORKERS
-_GRAD_ACCUM       = 2                            # effective batch = _TRAIN_BATCH_SIZE * 2
+_GRAD_ACCUM       = 2
+_TRAIN_BATCH_SIZE * 2
 
 
 def set_seed(seed=SEED):
@@ -54,7 +49,7 @@ def set_seed(seed=SEED):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Datasets  (giống train_lightgcn.py)
+# Datasets 
 # ─────────────────────────────────────────────────────────────────────────────
 
 class HMTrainDataset(Dataset):
@@ -238,37 +233,37 @@ class HMNGCFTrainer:
             print(f"[WARN] Model {self.model_name} không có init_item_embeddings_from_clip.")
 
     # ── Training ──────────────────────────────────────────────────────────
-
     def _train_epoch(self, model, loader, optimizer, edge_index, epoch: int = 0) -> float:
         model.train()
         model.invalidate_cache()
-
+    
         total_loss  = 0.0
         accum_count = 0
         optimizer.zero_grad()
-
+    
         pbar = tqdm(loader, desc=f"Epoch {epoch}/{NUM_EPOCHS} [train]", dynamic_ncols=True)
-
+    
         for step, (user_ids, pos_ids, neg_ids) in enumerate(pbar):
             user_ids = user_ids.to(self.device, non_blocking=True)
             pos_ids  = pos_ids.to(self.device,  non_blocking=True)
             neg_ids  = neg_ids.to(self.device,  non_blocking=True)
-
-            use_cache = (step % _GRAD_ACCUM != 0)
-            if not use_cache:
-                model.invalidate_cache()
-
-            all_user_emb, all_item_emb = model(edge_index, use_cache=use_cache)
-
+    
+            # ── THAY ĐỔI: autocast bọc cả forward lẫn loss ───────────────────
             with autocast("cuda"):
+                use_cache = (step % _GRAD_ACCUM != 0)
+                if not use_cache:
+                    model.invalidate_cache()
+    
+                all_user_emb, all_item_emb = model(edge_index, use_cache=use_cache)
+    
                 loss = bpr_loss(
                     all_user_emb[user_ids],
                     all_item_emb[pos_ids],
                     all_item_emb[neg_ids],
                 ) / _GRAD_ACCUM
-
+    
             self.scaler.scale(loss).backward()
-
+    
             is_last = (((step + 1) % _GRAD_ACCUM == 0) or ((step + 1) == len(loader)))
             if is_last:
                 self.scaler.unscale_(optimizer)
@@ -276,14 +271,14 @@ class HMNGCFTrainer:
                 self.scaler.step(optimizer)
                 self.scaler.update()
                 optimizer.zero_grad()
-
+    
             total_loss  += loss.item() * _GRAD_ACCUM
             accum_count += 1
             pbar.set_postfix(
                 loss=f"{loss.item() * _GRAD_ACCUM:.4f}",
                 avg=f"{total_loss / accum_count:.4f}",
             )
-
+    
         return total_loss / accum_count
 
     # ── Evaluation ────────────────────────────────────────────────────────
@@ -299,9 +294,12 @@ class HMNGCFTrainer:
             pin_memory=True,
             persistent_workers=(_NUM_WORKERS > 0),
         )
-        all_user_emb, all_item_emb = model(edge_index, use_cache=True)
+    
+        # ── THAY ĐỔI: autocast bọc cả forward ────────────────────────────────
+        with autocast("cuda"):
+            all_user_emb, all_item_emb = model(edge_index, use_cache=True)
+    
         preds, labels = [], []
-
         for user_ids, item_ids, label in tqdm(loader, desc="Evaluating"):
             user_ids = user_ids.to(self.device)
             item_ids = item_ids.to(self.device)
@@ -311,7 +309,7 @@ class HMNGCFTrainer:
                 )
             preds.extend(score.cpu().numpy())
             labels.extend(label.numpy())
-
+    
         return np.array(preds), np.array(labels)
 
     def _compute_metrics(self, preds: np.ndarray, labels: np.ndarray) -> dict:

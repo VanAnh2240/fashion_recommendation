@@ -112,46 +112,32 @@ class NGCF(nn.Module):
     # ── Core NGCF propagation ─────────────────────────────────────────────
 
     def _propagate(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        NGCF message passing:
-          e^{(l+1)}_u = LeakyReLU( W1 * e^{(l)}_u
-                                   + W1 * (A_norm @ e^{(l)})_u     [neighbourhood mean]
-                                   + W2 * (A_norm @ (e^{(l)}_u ⊙ e^{(l)}))_u )  [interaction]
-        Final embedding = concat of all layer outputs.
-        """
         assert self._norm_adj is not None, (
             "precompute_norm_adj() chưa được gọi trước khi forward()."
         )
-
-        device = self.user_embedding.weight.device
-
-        # All node embeddings in one matrix: [n_users + n_items, dim]
+    
         ego = torch.cat([self.user_embedding.weight,
                          self.item_embedding.weight], dim=0)  # (N, D)
-
+    
+        norm_adj_f32 = self._norm_adj.float()
+    
         all_layer_embs = [ego]
-
+    
         for l in range(self.num_layers):
-            # Neighbour aggregation: A_norm @ e^{(l)}
-            neigh = torch.sparse.mm(self._norm_adj, ego)               # (N, D)
-
-            # Element-wise interaction: A_norm @ (e^{(l)} ⊙ neigh)
-            interaction = torch.sparse.mm(self._norm_adj, ego * neigh) # (N, D)
-
-            # NGCF update rule
+            ego_f32 = ego.float()  
+    
+            neigh       = torch.sparse.mm(norm_adj_f32, ego_f32)
+            interaction = torch.sparse.mm(norm_adj_f32, ego_f32 * neigh)
+    
             ego_new = F.leaky_relu(
-                self.W1[l](ego + neigh) + self.W2[l](interaction),
+                self.W1[l](ego + neigh.to(ego.dtype)) + self.W2[l](interaction.to(ego.dtype)),
                 negative_slope=0.2,
             )
-            ego_new = F.dropout(ego_new, p=self.dropout, training=self.training)
-
             ego = ego_new
             all_layer_embs.append(ego)
-
-        # Concat all layers → richer representation
-        out = torch.cat(all_layer_embs, dim=-1)           # (N, D*(L+1))
-
-        # Split user / item
+    
+        out = torch.stack(all_layer_embs, dim=0).mean(dim=0)  # (N, D)
+    
         user_emb = out[:self.num_users]
         item_emb = out[self.num_users:]
         return user_emb, item_emb

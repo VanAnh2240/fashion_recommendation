@@ -6,14 +6,6 @@ import torch.nn.functional as F
 
 
 class LightGCN(nn.Module):
-    """
-    LightGCN: mô hình GNN đơn giản cho recommendation
-
-    FIX:
-    - Sửa bug forward() lồng nhau (cache không hoạt động)
-    - Thêm support khởi tạo từ CLIP embedding
-    - precompute_norm_adj yêu cầu edge_index đã có offset đúng
-    """
 
     def __init__(self, num_users, num_items, embedding_dim=64, num_layers=3):
         super().__init__()
@@ -75,10 +67,8 @@ class LightGCN(nn.Module):
         device = edge_index.device
         row, col = edge_index[0], edge_index[1]
 
-        # degree của mỗi node (cả hai chiều vì undirected)
         deg = torch.zeros(n, dtype=torch.float32, device=device)
         deg.scatter_add_(0, row, torch.ones_like(row, dtype=torch.float32))
-        # col đã được đếm ở chiều ngược (graph undirected nên đã có cả chiều)
 
         deg_inv_sqrt = (deg + 1e-10).pow(-0.5)
         values = deg_inv_sqrt[row] * deg_inv_sqrt[col]
@@ -107,7 +97,6 @@ class LightGCN(nn.Module):
             users_final: [n_users, embedding_dim]
             items_final: [n_items, embedding_dim]
         """
-        # FIX: cache check ở đúng chỗ (không phải trong nested function)
         if use_cache and self._cache_valid:
             return self._cached_user_emb, self._cached_item_emb
 
@@ -127,7 +116,6 @@ class LightGCN(nn.Module):
             all_emb = torch.sparse.mm(self._norm_adj.float(), all_emb)
             embs.append(all_emb)
 
-        # mean pooling qua các layer (LightGCN đặc trưng)
         final_emb = torch.stack(embs).mean(dim=0)
 
         users_final, items_final = torch.split(

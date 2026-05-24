@@ -29,7 +29,6 @@ def get_model(model_name, num_users=None, num_items=None, embedding_dim=64):
             embedding_dim=embedding_dim,
         )
     elif model_name == "bpr":
-        # FIX: BPRModel dùng n_users/n_items, không phải num_users/num_items
         return BPRModel(
             n_users=num_users,
             n_items=num_items,

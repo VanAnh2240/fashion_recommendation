@@ -6,16 +6,6 @@ import torch.nn.functional as F
 
 
 class GraphSAGE(nn.Module):
-    """
-    Optimized GraphSAGE (FAST FULL-GRAPH VERSION)
-
-    Fixes:
-    - COO → CSR sparse matrix (faster mm)
-    - adjacency build only once (cached, not rebuilt every forward)
-    - invalidate_cache chỉ reset embedding cache, không reset adj
-    - reduced overhead in forward
-    """
-
     def __init__(self, num_users, num_items, embedding_dim=64, hidden_dim=64, dropout=0.1):
         super().__init__()
 
@@ -39,8 +29,6 @@ class GraphSAGE(nn.Module):
     # ───────────────────────── cache ─────────────────────────
 
     def invalidate_cache(self):
-        # FIX: chỉ reset embedding cache, KHÔNG reset _adj
-        # _adj không đổi trong suốt quá trình training → không cần rebuild
         self._cache = None
 
     # ───────────────────────── CLIP init ─────────────────────
@@ -101,8 +89,6 @@ class GraphSAGE(nn.Module):
             self.item_embedding.weight
         ], dim=0)
 
-        # FIX: build adjacency một lần duy nhất, tái sử dụng mọi epoch
-        # edge_index không thay đổi trong training → không cần rebuild
         if self._adj is None:
             self._adj = self._build_adj(edge_index, self.num_users + self.num_items)
 

@@ -123,9 +123,6 @@ class HMEvalDataset(Dataset):
 # ─────────────────────────────────────────────────────────────────────────────
 # Loss
 # ─────────────────────────────────────────────────────────────────────────────
-
-# FIX: thêm L2 regularization vào BPR loss
-# Không có L2 → embedding norm tăng vô hạn → score collapse → model predict all-same
 def bpr_loss(user_emb, pos_emb, neg_emb, l2_reg: float = _L2_REG):
     pos_score = (user_emb * pos_emb).sum(dim=-1)
     neg_score = (user_emb * neg_emb).sum(dim=-1)
@@ -373,9 +370,6 @@ class HMGNNTrainer:
         except ValueError:
             auc = 0.5
 
-        # FIX: dùng Youden's J (tpr - fpr) để tìm threshold tối ưu từ ROC curve
-        # Median threshold sai vì với neg_ratio=1 (50/50 dataset), median luôn
-        # chia đôi → acc=prec=rec=f1 bất kể model học tốt hay không
         try:
             fpr, tpr, thresholds = roc_curve(y_true, preds)
             best_idx      = int(np.argmax(tpr - fpr))
@@ -462,9 +456,6 @@ class HMGNNTrainer:
             model.precompute_norm_adj(edge_index, n)
             print("[SETUP] norm_adj precomputed")
 
-        # FIX: differential LR — bảo vệ CLIP-initialized embeddings
-        # Embedding đã có semantic meaning từ CLIP → học chậm hơn (×0.1)
-        # Linear layer chưa có prior → học nhanh bình thường
         emb_params   = [p for n, p in model.named_parameters() if "embedding" in n]
         other_params = [p for n, p in model.named_parameters() if "embedding" not in n]
         optimizer = torch.optim.Adam([
@@ -485,7 +476,7 @@ class HMGNNTrainer:
         start_epoch      = 1
         best_auc         = 0.0
         best_epoch       = 0
-        epochs_no_improve = 0      # FIX: early stopping counter
+        epochs_no_improve = 0    
         _EARLY_STOP_PATIENCE = 5
 
         if ckpt_path.exists():
@@ -504,9 +495,6 @@ class HMGNNTrainer:
             torch.cuda.empty_cache()
 
         for epoch in range(start_epoch, NUM_EPOCHS + 1):
-            # FIX: delay hard negatives đến epoch 6
-            # Epoch 1-5: uniform sampling để model ổn định với CLIP init
-            # Epoch 6+: popularity-based hard negatives
             if epoch <= 5:
                 train_dataset.resample(item_popularity=None)
             else:

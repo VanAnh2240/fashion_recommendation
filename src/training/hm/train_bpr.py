@@ -23,11 +23,6 @@ from src.models.bpr import BPRModel
 
 _CSV_CHUNK   = 500_000
 _NUM_WORKERS = 4
-
-# FIX: override các hyperparams không phù hợp cho BPR large-scale
-# LEARNING_RATE từ config (2e-4) quá nhỏ → dùng 1e-3
-# WEIGHT_DECAY từ config (1e-4) quá lớn → dùng 1e-6
-# LOGIT_SCALE từ config (2.0) scale down score → dùng 1.0
 _LR           = 1e-3
 _WEIGHT_DECAY = 1e-6
 _LOGIT_SCALE  = 1.0
