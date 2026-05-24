@@ -42,7 +42,12 @@ def clear_cache():
     _cache.clear()
     gc.collect()
     if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+        try:
+            torch.cuda.empty_cache()
+        except Exception as e:
+            # CUDA context có thể bị corrupt sau device-side assert
+            # → bỏ qua, không crash toàn bộ evaluation
+            print(f"[WARN] clear_cache: cuda.empty_cache() failed ({e})")
 
 
 def set_seed(seed=SEED):
@@ -54,7 +59,7 @@ def set_seed(seed=SEED):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Datasets (không đổi)
+# Datasets
 # ─────────────────────────────────────────────────────────────────────────────
 
 class EvalDataset(Dataset):
@@ -87,7 +92,32 @@ class EvalDataset(Dataset):
         )
 
 
-class SiameseEvalDataset(Dataset):
+class BPREvalDatasetSimple(Dataset):
+    """
+    Eval dataset cho BPR — không dùng adj_csr để tránh OOM.
+    Với H&M (1M+ users, 100K items), P(neg trùng pos) < 0.1% → chấp nhận được.
+    Pre-generate negatives lúc __init__ → DataLoader multi-worker OK.
+    """
+    def __init__(self, user_ids: np.ndarray, item_ids: np.ndarray, n_items: int):
+        n = len(user_ids)
+        neg_items = np.random.randint(0, n_items, n, dtype=np.int32)
+
+        all_u = np.concatenate([user_ids, user_ids])
+        all_i = np.concatenate([item_ids, neg_items])
+        all_l = np.concatenate([np.ones(n, np.float32), np.zeros(n, np.float32)])
+
+        self.users  = torch.from_numpy(all_u.astype(np.int32))
+        self.items  = torch.from_numpy(all_i.astype(np.int32))
+        self.labels = torch.from_numpy(all_l)
+
+    def __len__(self):
+        return len(self.users)
+
+    def __getitem__(self, idx):
+        return self.users[idx], self.items[idx], self.labels[idx]
+
+
+
     def __init__(self, test_users, test_items, test_times,
                  train_users, train_items, train_times,
                  item_feat, item_counts, hard_neg_k=5_000, neg_ratio=1):
@@ -135,7 +165,7 @@ class SiameseEvalDataset(Dataset):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ModelEvaluator — dùng cache cho mọi I/O nặng
+# ModelEvaluator
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ModelEvaluator:
@@ -246,7 +276,12 @@ class ModelEvaluator:
     # ── checkpoint ────────────────────────────────────────────────────────
 
     def _load_checkpoint(self, model):
-        ckpt_name = f"{self.feature}_{self.model_name}.pth"
+        # FIX: BPR không có feature prefix → tên file khác GNN/siamese
+        if self.model_name == "bpr":
+            ckpt_name = "bpr.pth"
+        else:
+            ckpt_name = f"{self.feature}_{self.model_name}.pth"
+
         ckpt_path = self.ckpt_dir / ckpt_name
         if not ckpt_path.exists():
             raise FileNotFoundError(
@@ -269,33 +304,55 @@ class ModelEvaluator:
             persistent_workers=(nw > 0),
         )
 
+    def _normalize_scores(self, preds: np.ndarray, label: str = "") -> np.ndarray:
+        """Min-max normalize scores về [0, 1] để threshold có ý nghĩa."""
+        score_min, score_max = preds.min(), preds.max()
+        if score_max - score_min > 1e-8:
+            return (preds - score_min) / (score_max - score_min)
+        prefix = f"[{label}] " if label else ""
+        print(f"{prefix}[WARN] All scores identical — model may not be learning.")
+        return preds
+
     @torch.no_grad()
     def _run_gnn_inference(self, model, dataset, edge_index):
         model.eval()
         all_user_emb, all_item_emb = model(edge_index, use_cache=False)
         preds, labels = [], []
+
         for user_ids, item_ids, label in self._make_loader(dataset):
             user_ids = user_ids.to(self.device)
             item_ids = item_ids.to(self.device)
             with autocast("cuda"):
-                score = torch.sigmoid(
-                    (all_user_emb[user_ids] * all_item_emb[item_ids]).sum(dim=-1)
-                )
-            preds.extend(score.cpu().numpy())
+                # FIX: raw dot-product, không sigmoid
+                # BPR score không calibrate cho sigmoid threshold tuyệt đối
+                score = (all_user_emb[user_ids] * all_item_emb[item_ids]).sum(dim=-1)
+            preds.extend(score.cpu().float().numpy())
             labels.extend(label.numpy())
-        return np.array(preds), np.array(labels)
+
+        preds  = np.array(preds, dtype=np.float64)
+        labels = np.array(labels)
+        # FIX: normalize để Youden threshold trong metrics.py hoạt động đúng
+        preds  = self._normalize_scores(preds, label=self.model_name)
+        return preds, labels
 
     @torch.no_grad()
     def _run_bpr_inference(self, model, dataset):
         model.eval()
         preds, labels = [], []
+
         for user_ids, item_ids, label in self._make_loader(dataset):
             user_ids = user_ids.to(self.device)
             item_ids = item_ids.to(self.device)
-            score = torch.sigmoid(model.predict(user_ids, item_ids))
-            preds.extend(score.cpu().numpy())
+            # FIX: raw dot-product, không sigmoid — nhất quán với BPR loss
+            score = model.predict(user_ids, item_ids)
+            preds.extend(score.cpu().float().numpy())
             labels.extend(label.numpy())
-        return np.array(preds), np.array(labels)
+
+        preds  = np.array(preds, dtype=np.float64)
+        labels = np.array(labels)
+        # FIX: normalize để Youden threshold trong metrics.py hoạt động đúng
+        preds  = self._normalize_scores(preds, label="bpr")
+        return preds, labels
 
     @torch.no_grad()
     def _run_siamese_inference(self, model, dataset):
@@ -322,24 +379,101 @@ class ModelEvaluator:
 
         user2idx, item2idx = self._load_mappings(meta)
 
-        if self.model_name in ALL_GNN_MODELS or self.model_name == "bpr":
+        if self.model_name in ALL_GNN_MODELS:
             adj_csr = self._load_adj()
             test_users, test_items = self._load_split_arrays(
                 "test", user2idx, item2idx, with_time=False)
             print(f"[TEST] interactions={len(test_users):,}")
             test_dataset = EvalDataset(test_users, test_items, n_items, adj_csr)
 
-            model = get_model(self.model_name, num_users=n_users,
-                              num_items=n_items, embedding_dim=EMBEDDING_DIM).to(self.device)
+            model = get_model(
+                self.model_name,
+                num_users=n_users,
+                num_items=n_items,
+                embedding_dim=EMBEDDING_DIM,
+            ).to(self.device)
             model = self._load_checkpoint(model)
 
-            if self.model_name in ALL_GNN_MODELS:
-                edge_index = self._load_edge_index()
-                if self.model_name == "lightgcn":
-                    model.precompute_norm_adj(edge_index, n_users + n_items)
-                return self._run_gnn_inference(model, test_dataset, edge_index)
-            else:
-                return self._run_bpr_inference(model, test_dataset)
+            edge_index = self._load_edge_index()
+            if self.model_name == "lightgcn":
+                model.precompute_norm_adj(edge_index, n_users + n_items)
+            return self._run_gnn_inference(model, test_dataset, edge_index)
+
+        elif self.model_name == "bpr":
+            # FIX: BPR có index map riêng (sorted unique từ train.csv) → khác GNN meta
+            # FIX: KHÔNG build adj_csr — tốn RAM, với 1M+ users xác suất neg trùng pos ≈ 0
+            # FIX: clear GNN cache trước khi load BPR để giải phóng RAM
+            _cache.clear()
+            gc.collect()
+
+            ckpt_path = self.ckpt_dir / "bpr.pth"
+            ckpt_tmp  = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            ckpt_n_users = ckpt_tmp.get("n_users")
+            ckpt_n_items = ckpt_tmp.get("n_items")
+            del ckpt_tmp
+
+            if ckpt_n_users is None or ckpt_n_items is None:
+                raise ValueError(
+                    "[BPR] Checkpoint không có n_users/n_items. "
+                    "Hãy retrain với train_bpr_hm.py."
+                )
+            print(f"[BPR] ckpt size: n_users={ckpt_n_users:,}  n_items={ckpt_n_items:,}")
+
+            # Rebuild BPR index map từ train.csv — giống HMBPRTrainer._build_idx_maps
+            print("[BPR] Building index map from train.csv...")
+            unique_users: set = set()
+            unique_items: set = set()
+            for chunk in pd.read_csv(
+                self.data_dir / "train.csv",
+                usecols=["customer_id", "article_id"],
+                dtype=str, chunksize=CSV_CHUNK,
+            ):
+                chunk["article_id"] = chunk["article_id"].str.zfill(10)
+                unique_users.update(chunk["customer_id"].tolist())
+                unique_items.update(chunk["article_id"].tolist())
+            bpr_user2idx = {u: i for i, u in enumerate(sorted(unique_users))}
+            bpr_item2idx = {it: i for i, it in enumerate(sorted(unique_items))}
+            del unique_users, unique_items
+            gc.collect()
+            print(f"[BPR] index map: users={len(bpr_user2idx):,}  items={len(bpr_item2idx):,}")
+
+            # Load test split với BPR index map
+            u_bufs, i_bufs = [], []
+            dropped = 0
+            for chunk in pd.read_csv(
+                self.data_dir / "test.csv",
+                usecols=["customer_id", "article_id"],
+                dtype=str, chunksize=CSV_CHUNK,
+            ):
+                chunk["article_id"] = chunk["article_id"].str.zfill(10)
+                u    = chunk["customer_id"].map(bpr_user2idx)
+                i    = chunk["article_id"].map(bpr_item2idx)
+                mask = u.notna() & i.notna()
+                dropped += (~mask).sum()
+                u_bufs.append(u[mask].values.astype(np.int32))
+                i_bufs.append(i[mask].values.astype(np.int32))
+            if dropped:
+                print(f"  [MAP] test (bpr): dropped {dropped:,} rows")
+            bpr_test_users = np.concatenate(u_bufs)
+            bpr_test_items = np.concatenate(i_bufs)
+            del bpr_user2idx, bpr_item2idx, u_bufs, i_bufs
+            gc.collect()
+            print(f"[TEST] interactions={len(bpr_test_users):,}")
+
+            # Dùng BPREvalDatasetSimple — không cần adj_csr, random negative thuần túy
+            # Với 1M+ users, P(neg trùng pos của 1 user) ≈ items_per_user/n_items < 0.1%
+            test_dataset = BPREvalDatasetSimple(bpr_test_users, bpr_test_items, ckpt_n_items)
+            del bpr_test_users, bpr_test_items
+            gc.collect()
+
+            model = get_model(
+                "bpr",
+                num_users=ckpt_n_users,
+                num_items=ckpt_n_items,
+                embedding_dim=EMBEDDING_DIM,
+            ).to(self.device)
+            model = self._load_checkpoint(model)
+            return self._run_bpr_inference(model, test_dataset)
 
         elif self.model_name == "siamese":
             item_feat = self._load_item_feat_numpy(n_items, item2idx)
@@ -390,14 +524,16 @@ def run_evaluation(dataset, feature, model_name):
         set_seed(SEED)
         evaluator = Evaluator()
 
-        # Bước 1: Scan checkpoints
         candidates = []
         for m_name, m_feat in _ALL_MODELS:
             if feature is not None and m_feat != feature:
                 continue
-            ckpt_dir  = (CHECKPOINT_DIR / dataset / m_feat / m_name
-                         if m_feat else CHECKPOINT_DIR / dataset / m_name)
-            ckpt_name = f"{m_feat}_{m_name}.pth" if m_feat else f"{m_name}.pth"
+            if m_feat:
+                ckpt_dir  = CHECKPOINT_DIR / dataset / m_feat / m_name
+                ckpt_name = f"{m_feat}_{m_name}.pth"
+            else:
+                ckpt_dir  = CHECKPOINT_DIR / dataset / m_name
+                ckpt_name = f"{m_name}.pth"
             if (ckpt_dir / ckpt_name).exists():
                 candidates.append((m_name, m_feat))
 
@@ -407,10 +543,10 @@ def run_evaluation(dataset, feature, model_name):
 
         print(f"[SCAN] Tìm thấy {len(candidates)} checkpoint(s):")
         for m_name, m_feat in candidates:
-            print(f"  • {m_feat}_{m_name}.pth")
+            ckpt_name = f"{m_feat}_{m_name}.pth" if m_feat else f"{m_name}.pth"
+            print(f"  • {ckpt_name}")
         print()
 
-        # Bước 2: Evaluate — data nặng tự động được cache
         results = {}
         for m_name, m_feat in candidates:
             try:
@@ -424,7 +560,6 @@ def run_evaluation(dataset, feature, model_name):
             except Exception as e:
                 print(f"[ERROR] {m_name}/{m_feat}: {e}")
 
-        # Bước 3: Ghi report một lần
         evaluator.save_report(dataset)
         clear_cache()
         return results

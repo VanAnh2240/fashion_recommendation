@@ -16,7 +16,7 @@ class BPRModel(nn.Module):
         n_users: int,
         n_items: int,
         embedding_dim: int = 64,
-        logit_scale: float = 1.0,   # FIX: 2.0 → 1.0 (bớt scale down score)
+        logit_scale: float = 1.0, 
     ):
         super().__init__()
         self.n_users       = n_users
@@ -27,9 +27,6 @@ class BPRModel(nn.Module):
         self.user_emb = nn.Embedding(n_users, embedding_dim)
         self.item_emb = nn.Embedding(n_items, embedding_dim)
 
-        # FIX: xavier_uniform_ → normal_(std=0.1)
-        # xavier tính fan_in từ n_users (~1.3M) → std cực nhỏ (~0.001) → gradient chết
-        # normal std=0.1 là convention chuẩn cho BPR/MF large-scale
         nn.init.normal_(self.user_emb.weight, mean=0.0, std=0.1)
         nn.init.normal_(self.item_emb.weight, mean=0.0, std=0.1)
 

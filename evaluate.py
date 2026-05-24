@@ -37,7 +37,7 @@ def main():
     run_evaluation(
         dataset    = args.dataset,
         feature    = args.feature,
-        model_name = args.model,     # None → evaluate ALL
+        model_name = args.model,    
     )
 
 
