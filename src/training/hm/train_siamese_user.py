@@ -82,7 +82,6 @@ def to_shared_tensor(arr: np.ndarray) -> torch.Tensor:
       - Truy cập nhanh hơn mmap
     """
     t = torch.from_numpy(np.ascontiguousarray(arr))
-    t.share_memory_()
     return t
 
 

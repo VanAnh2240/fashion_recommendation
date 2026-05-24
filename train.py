@@ -64,10 +64,22 @@ def main():
 
         evaluator = Evaluator()
 
-        if args.model in ("lightgcn", "graphsage", "ngcf"):
-            from src.training.hm.train_gnn import HMGNNTrainer
+        if args.model == "lightgcn":
+            from src.training.hm.train_lightgcn import HMGNNTrainer
             trainer = HMGNNTrainer(
                 model_name=args.model,
+                feature=args.feature
+            )
+        elif args.model == "graphsage":
+            from src.training.hm.train_graphsage import HMGNNTrainer
+            trainer = HMGNNTrainer(
+                model_name=args.model,
+                feature=args.feature
+            )
+            
+        elif args.model == "ngcf":
+            from src.training.hm.train_ngcf import HMNGCFTrainer
+            trainer = HMNGCFTrainer(
                 feature=args.feature
             )
 

@@ -1,4 +1,6 @@
-# File src/models/ngcf.py
+"""
+src/models/ngcf.py — Neural Graph Collaborative Filtering
+"""
 
 import torch
 import torch.nn as nn
@@ -7,96 +9,197 @@ import torch.nn.functional as F
 
 class NGCF(nn.Module):
     """
-    NGCF: Neural Graph Collaborative Filtering
+    Neural Graph Collaborative Filtering (Wang et al., 2019).
+    Giữ nguyên transformation matrices (W1, W2) và nonlinear activation.
+    Học được interaction phức tạp hơn LightGCN nhưng nặng hơn.
 
-    Khác LightGCN:
-    - Có transformation matrix (W1, W2)
-    - Có nonlinear activation
-    - Learning interaction phức tạp hơn
-
-    FIX:
-    - Thêm support init item embedding từ CLIP
+    Tương thích hoàn toàn với HMGNNTrainer:
+      - forward(edge_index, use_cache) → (all_user_emb, all_item_emb)
+      - invalidate_cache()
+      - precompute_norm_adj(edge_index, n_nodes)   [gọi 1 lần trước khi train]
+      - init_item_embeddings_from_clip(item_feat)  [warm-start từ CLIP]
+      - predict(user_ids, item_ids)                [dùng trong BPR inference]
     """
 
-    def __init__(self, num_users, num_items, embedding_dim=64, num_layers=3):
-        super(NGCF, self).__init__()
-
-        self.num_users = num_users
-        self.num_items = num_items
+    def __init__(
+        self,
+        num_users: int,
+        num_items: int,
+        embedding_dim: int = 64,
+        num_layers: int = 3,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.num_users     = num_users
+        self.num_items     = num_items
         self.embedding_dim = embedding_dim
-        self.num_layers = num_layers
+        self.num_layers    = num_layers
+        self.dropout       = dropout
 
+        # ── Embedding tables ──────────────────────────────────────────────
         self.user_embedding = nn.Embedding(num_users, embedding_dim)
         self.item_embedding = nn.Embedding(num_items, embedding_dim)
-
-        self.W1 = nn.ModuleList()
-        self.W2 = nn.ModuleList()
-
-        for _ in range(num_layers):
-            self.W1.append(nn.Linear(embedding_dim, embedding_dim))
-            self.W2.append(nn.Linear(embedding_dim, embedding_dim))
-
         nn.init.xavier_uniform_(self.user_embedding.weight)
         nn.init.xavier_uniform_(self.item_embedding.weight)
 
-    def init_item_embeddings_from_clip(self, item_feat: torch.Tensor):
-        feat_dim = item_feat.shape[1]
-        embedding_dim = self.embedding_dim
+        # ── Per-layer transformation matrices (W1, W2) ────────────────────
+        # W1: self-interaction  (dim → dim)
+        # W2: neighbour-interaction (dim → dim)
+        self.W1 = nn.ModuleList([
+            nn.Linear(embedding_dim, embedding_dim, bias=True)
+            for _ in range(num_layers)
+        ])
+        self.W2 = nn.ModuleList([
+            nn.Linear(embedding_dim, embedding_dim, bias=True)
+            for _ in range(num_layers)
+        ])
+        for layer in range(num_layers):
+            nn.init.xavier_uniform_(self.W1[layer].weight)
+            nn.init.xavier_uniform_(self.W2[layer].weight)
 
-        if feat_dim != embedding_dim:
-            proj = nn.Linear(feat_dim, embedding_dim, bias=False)
+        # ── Normalised adjacency (cached after precompute_norm_adj) ───────
+        self._norm_adj: torch.Tensor | None = None
+
+        # ── Inference cache ───────────────────────────────────────────────
+        self._cached_user_emb: torch.Tensor | None = None
+        self._cached_item_emb: torch.Tensor | None = None
+
+    # ── Public helpers (expected by trainer) ──────────────────────────────
+
+    def precompute_norm_adj(self, edge_index: torch.Tensor, n_nodes: int):
+        """
+        Tính D^{-1/2} A D^{-1/2} và cache lại dưới dạng sparse COO tensor.
+        Gọi 1 lần trước khi train, không cần gọi lại.
+        """
+        device = edge_index.device
+
+        row = edge_index[0]
+        col = edge_index[1]
+
+        # Degree vector
+        deg = torch.zeros(n_nodes, dtype=torch.float32, device=device)
+        deg.scatter_add_(0, row, torch.ones(row.size(0), dtype=torch.float32, device=device))
+
+        d_inv_sqrt = deg.pow(-0.5)
+        d_inv_sqrt[d_inv_sqrt == float("inf")] = 0.0
+
+        # Normalise edge weights: d_i^{-1/2} * d_j^{-1/2}
+        norm_vals = d_inv_sqrt[row] * d_inv_sqrt[col]
+
+        self._norm_adj = torch.sparse_coo_tensor(
+            edge_index,
+            norm_vals,
+            size=(n_nodes, n_nodes),
+            device=device,
+        ).coalesce()
+
+        print(f"[NGCF] norm_adj built | nodes={n_nodes:,}  edges={row.size(0):,}")
+
+    def init_item_embeddings_from_clip(self, item_feat: torch.Tensor):
+        """
+        Warm-start item_embedding.weight từ CLIP/FashionCLIP embedding.
+        item_feat: (n_items, clip_dim) — sẽ được project nếu clip_dim ≠ embedding_dim.
+        """
+        n, clip_dim = item_feat.shape
+        if clip_dim != self.embedding_dim:
+            # Linear projection tạm thời (không lưu weight)
+            proj = nn.Linear(clip_dim, self.embedding_dim, bias=False).to(item_feat.device)
             nn.init.xavier_uniform_(proj.weight)
             with torch.no_grad():
-                projected = proj(item_feat.float())
+                projected = proj(item_feat)
         else:
-            projected = item_feat.float()
+            projected = item_feat
 
         with torch.no_grad():
-            self.item_embedding.weight.copy_(projected)
+            # Normalize về unit sphere trước khi inject
+            norms = projected.norm(dim=1, keepdim=True).clamp(min=1e-8)
+            self.item_embedding.weight[:n].copy_(projected / norms)
 
-        print(f"[NGCF] item_embedding initialized from CLIP features ✓")
+        print(f"[NGCF] item_embedding initialized from CLIP ({clip_dim}→{self.embedding_dim})")
 
-    def forward(self, edge_index):
-        users = self.user_embedding.weight
-        items = self.item_embedding.weight
+    def invalidate_cache(self):
+        self._cached_user_emb = None
+        self._cached_item_emb = None
 
-        all_emb = torch.cat([users, items], dim=0)
-        layer_embs = [all_emb]
+    # ── Core NGCF propagation ─────────────────────────────────────────────
 
-        for layer in range(self.num_layers):
-            all_emb = self.propagate(edge_index, all_emb, layer)
-            layer_embs.append(all_emb)
-
-        final_emb = torch.mean(torch.stack(layer_embs, dim=0), dim=0)
-
-        users_final, items_final = torch.split(
-            final_emb,
-            [self.num_users, self.num_items],
+    def _propagate(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        NGCF message passing:
+          e^{(l+1)}_u = LeakyReLU( W1 * e^{(l)}_u
+                                   + W1 * (A_norm @ e^{(l)})_u     [neighbourhood mean]
+                                   + W2 * (A_norm @ (e^{(l)}_u ⊙ e^{(l)}))_u )  [interaction]
+        Final embedding = concat of all layer outputs.
+        """
+        assert self._norm_adj is not None, (
+            "precompute_norm_adj() chưa được gọi trước khi forward()."
         )
 
-        return users_final, items_final
+        device = self.user_embedding.weight.device
 
-    def propagate(self, edge_index, emb, layer):
-        row, col = edge_index
-        n = emb.size(0)
+        # All node embeddings in one matrix: [n_users + n_items, dim]
+        ego = torch.cat([self.user_embedding.weight,
+                         self.item_embedding.weight], dim=0)  # (N, D)
 
-        # FIX: degree normalize đúng cho cả row và col (giống GraphSAGE fix)
-        neigh_emb = torch.zeros_like(emb)
-        neigh_emb.index_add_(0, row, emb[col])
-        neigh_emb.index_add_(0, col, emb[row])
+        all_layer_embs = [ego]
 
-        deg_row = torch.bincount(row, minlength=n).float()
-        deg_col = torch.bincount(col, minlength=n).float()
-        deg = (deg_row + deg_col).unsqueeze(1).clamp(min=1e-10)
-        neigh_emb = neigh_emb / deg
+        for l in range(self.num_layers):
+            # Neighbour aggregation: A_norm @ e^{(l)}
+            neigh = torch.sparse.mm(self._norm_adj, ego)               # (N, D)
 
-        self_emb    = self.W1[layer](emb)
-        neigh_emb   = self.W2[layer](neigh_emb)
-        interaction = self_emb * neigh_emb
+            # Element-wise interaction: A_norm @ (e^{(l)} ⊙ neigh)
+            interaction = torch.sparse.mm(self._norm_adj, ego * neigh) # (N, D)
 
-        out = F.relu(self_emb + neigh_emb + interaction)
+            # NGCF update rule
+            ego_new = F.leaky_relu(
+                self.W1[l](ego + neigh) + self.W2[l](interaction),
+                negative_slope=0.2,
+            )
+            ego_new = F.dropout(ego_new, p=self.dropout, training=self.training)
 
-        return out
+            ego = ego_new
+            all_layer_embs.append(ego)
 
-    def predict(self, users_emb, items_emb, u, i):
-        return torch.sum(users_emb[u] * items_emb[i], dim=1)
+        # Concat all layers → richer representation
+        out = torch.cat(all_layer_embs, dim=-1)           # (N, D*(L+1))
+
+        # Split user / item
+        user_emb = out[:self.num_users]
+        item_emb = out[self.num_users:]
+        return user_emb, item_emb
+
+    # ── forward ───────────────────────────────────────────────────────────
+
+    def forward(
+        self,
+        edge_index: torch.Tensor,
+        use_cache: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Parameters
+        ----------
+        edge_index : không được dùng trực tiếp (đã precompute trong norm_adj),
+                     giữ signature để tương thích với trainer chung.
+        use_cache  : nếu True và đã có cache → trả về ngay.
+        """
+        if use_cache and self._cached_user_emb is not None:
+            return self._cached_user_emb, self._cached_item_emb
+
+        user_emb, item_emb = self._propagate()
+
+        if use_cache:
+            self._cached_user_emb = user_emb
+            self._cached_item_emb = item_emb
+
+        return user_emb, item_emb
+
+    # ── predict (dùng cho inference / runner.py) ──────────────────────────
+
+    @torch.no_grad()
+    def predict(self, user_ids: torch.Tensor, item_ids: torch.Tensor) -> torch.Tensor:
+        """
+        Trả về raw dot-product score (không sigmoid) cho từng cặp (user, item).
+        """
+        user_emb, item_emb = self.forward(None, use_cache=True)
+        score = (user_emb[user_ids] * item_emb[item_ids]).sum(dim=-1)
+        return score
