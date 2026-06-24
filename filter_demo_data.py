@@ -102,7 +102,7 @@ eligible_users = user_counts[
     user_counts >= MIN_PURCHASES
 ].sort_values(ascending=False)
 
-# Lấy spread đều để đa dạng
+
 step = max(1, len(eligible_users) // N_USERS)
 selected_users = eligible_users.iloc[::step].head(N_USERS).index.tolist()
 

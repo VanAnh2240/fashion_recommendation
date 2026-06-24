@@ -23,7 +23,7 @@ class _State:
     users_emb   : np.ndarray = None  
     items_emb   : np.ndarray = None
     article_ids : list       = []
-    article_idx : dict       = {}    # article_id → row index (lookup O(1))
+    article_idx : dict       = {}
 
 S = _State()
 app = FastAPI(title="AuraFit Recommendation API", version="1.0.0")
@@ -37,8 +37,7 @@ def load_model():
     df = pd.read_csv(ARTICLE_IDS_CSV, dtype={"article_id": str})
     df["article_id"] = df["article_id"].str.zfill(10)
     S.article_ids = df["article_id"].tolist()
-    S.article_idx = {aid: i for i, aid in enumerate(S.article_ids)}  # ← thêm dòng này
-
+    S.article_idx = {aid: i for i, aid in enumerate(S.article_ids)}
     if os.path.exists(EMB_CACHE_PATH):
         print(f"[startup] Loading embeddings cache từ {EMB_CACHE_PATH} ...")
         cache = np.load(EMB_CACHE_PATH)
@@ -131,8 +130,8 @@ def recommend_filter(customer_id: int, req: FilterRequest):
 
     user_vec     = S.users_emb[customer_id]
     idx_arr      = np.array(indices, dtype=np.int32)
-    subset_emb   = S.items_emb[idx_arr]          # (N_db, D)
-    subset_scores = subset_emb @ user_vec         # (N_db,)
+    subset_emb   = S.items_emb[idx_arr]      
+    subset_scores = subset_emb @ user_vec   
 
     top_k = min(req.top_k, len(indices))
     top_pos = np.argsort(subset_scores)[::-1][:top_k]
