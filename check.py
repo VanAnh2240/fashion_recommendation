@@ -20,8 +20,6 @@ def main():
     if torch.cuda.is_available():
         print("GPU:", torch.cuda.get_device_name(0))
         print("CUDA:", torch.version.cuda)
-
-    # Quick GPU test
     if torch.cuda.is_available():
         x = torch.rand(2, 2).cuda()
         print("GPU test tensor OK")

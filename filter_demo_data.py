@@ -1,20 +1,5 @@
 """
-filter_demo_data.py — Lọc data H&M cho demo: 20 user nữ, 18-35 tuổi, Ladieswear.
-
-Đầu vào:
-    data/processed/hm/test.csv
-    data/processed/hm/articles.csv
-    data/processed/hm/customers.csv
-    embeddings/hm/fashionclip/embeddings.npy
-    embeddings/hm/fashionclip/article_ids.csv
-
-Đầu ra → data/demo/:
-    test_20users.csv, 
-    articles_demo.csv, 
-    article_ids_demo.csv,
-    embeddings_demo.npy, 
-    user_list.csv, images/, 
-    demo_summary.txt
+filter_demo_data.py
 """
 import shutil, os
 import numpy as np
